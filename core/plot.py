@@ -49,3 +49,8 @@ def plot_chroms(rt, eic, red_eics=None, blue_eics=None):
             plt.plot(rt, blue_eics[i,:], color='blue')
     plt.show()
     
+    
+    
+    
+    
+    
