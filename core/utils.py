@@ -8,8 +8,8 @@ Created on Tue Dec 31 09:14:11 2019
 import pymzml
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import tensorflow.compat.v1 as tf
+from sklearn.linear_model import LinearRegression
 from tqdm import tqdm
 from scipy import signal
 from bisect import bisect_left, bisect_right
@@ -17,6 +17,7 @@ from prosit import model
 from prosit import prediction
 from prosit import constants
 from prosit import tensorize
+from pyopenms import AASequence, EmpiricalFormula, CoarseIsotopePatternGenerator, MSSpectrum, Deisotoper
 from seq_encode.ms import ms_to_vec
 
 
@@ -27,7 +28,7 @@ def load_data(mzml, swath):
     Parameters
     ----------
     mzml : str
-        The path of the ms file. Only *.mzml support mzml, other format can be
+        The path of the ms file. Only *.mzml is support, other format can be
         converted by ProteoWizard. Note: the peaks should be in centroid mode.
     swath : str
         The path of the SWTAH window file. Shold be *.csv format. Include columns: 
@@ -48,6 +49,32 @@ def load_data(mzml, swath):
             'precursors': precursors,
             'window': window,
             'peaks': all_peaks}
+
+
+def calc_isotope(pep, charge=2):
+    """
+    calculate isotope distribution of a peptide.
+    
+    Parameters
+    ----------
+    pep : str
+        The peptide sequence.
+    charge : int
+        The charge of the peptide precursor.
+    """
+
+    seq = AASequence.fromString(pep)
+    seq_formula = seq.getFormula() + EmpiricalFormula("H" + str(charge))
+    isotopes = seq_formula.getIsotopeDistribution(CoarseIsotopePatternGenerator(4))
+
+    pattern = {'isotope': [], 'abundance': []}
+    s = MSSpectrum()
+    for iso in isotopes.getContainer():
+        iso.setMZ(iso.getMZ() / charge)
+        s.push_back(iso)
+        pattern['isotope'].append(iso.getMZ())
+        pattern['abundance'].append(iso.getIntensity())
+    return pd.DataFrame(pattern)
 
 
 def predict_library(peplist):
@@ -92,6 +119,7 @@ def predict_library(peplist):
         n = pep['modified_sequence'][i] + '_'
         n += str(pep['collision_energy'][i]) + 'NCE_'
         n += str(pep['precursor_charge'][i]) + '+'
+        isot = calc_isotope(pep['modified_sequence'][i], pep['precursor_charge'][i])
         irt = pept['iRT'][i][0]
         mz = pept['masses_pred'][i]
         abund = pept['intensities_pred'][i]
@@ -111,7 +139,7 @@ def predict_library(peplist):
             mw += constants.AMINO_ACID[aa]
         precursor = (mw + constants.H2O + constants.PROTON * pep['precursor_charge'][i]) / pep['precursor_charge'][i]
         
-        output[n] = {'irt': irt, 'mz': mz, 'intensity': abund, 'precursor': precursor}
+        output[n] = {'irt': irt, 'mz': mz, 'intensity': abund, 'precursor': precursor, 'isotope': isot}
     return output
     
 
@@ -167,7 +195,7 @@ def get_ms2(data, exmz, exrt):
         A list of the targeted retention time.
     """
     window = data['window']
-    wid = np.where(np.logical_and(window['start_mz'] < exmz , window['end_mz'] > exmz))[0][0] + 1
+    wid = np.where(np.logical_and(window['start_mz'] < exmz, window['end_mz'] > exmz))[0][0] + 1
     ind1 = np.arange(wid, len(data['peaks']), len(data['precursors']))
     
     output = {}
@@ -177,9 +205,35 @@ def get_ms2(data, exmz, exrt):
         peak = data['peaks'][ind1[rid]].centroidedPeaks
         output[str(r)] = peak
     return output
-    
 
-def irt_curve(data, irtlib, irteic, mscor=0.9):
+
+def get_ms1(data, exrt):
+    """
+    Get the ms1 spectrum of a targeted scan.
+
+    Parameters
+    ----------
+    data : dict
+        The results returned by the *load_data* function.
+    exrt : list
+        The targeted retention time.
+    """
+
+    ind = np.arange(0, len(data['peaks']), len(data['precursors']))
+    output = {}
+    rts = data['rts'][ind]
+    for r in exrt:
+        rid = np.argmin(np.abs(rts - r))
+        peak = data['peaks'][ind[rid]].centroidedPeaks
+        output[str(r)] = peak
+    return output
+
+
+def dpscore(v1, v2):
+    return np.dot(v1, v2) / np.sqrt(np.dot(v1, v1) * np.dot(v2, v2))
+
+
+def irt_curve(data, irtlib, irteic, mscor=0.85):
     """
     Get the calibration curve based on the iRT peptides
     
@@ -192,6 +246,8 @@ def irt_curve(data, irtlib, irteic, mscor=0.9):
     mscor : float
         The threshold of ms/ms similairty between the ms in library and the ms in raw data.
     """
+    allrt, allirt, allscore = [], [], []
+    mtv = ms_to_vec(max_mz = 2000)
     for i in range(len(irteic)):
         k = list(irteic.keys())[i]
         eic = irteic[k]
@@ -201,96 +257,68 @@ def irt_curve(data, irtlib, irteic, mscor=0.9):
         exrt = rts[pks]
         exmz = irtlib[k]['precursor']
         fragms = np.array([irtlib[k]['mz'], irtlib[k]['intensity']]).transpose()
-    
+        precms = np.array(irtlib[k]['isotope'])
+        fragvec = mtv.transform(fragms)
+        precvec = mtv.transform(precms)
+        candms1 = get_ms1(data, exrt)
+        candms2 = get_ms2(data, exmz, exrt)
 
+        compress1 = np.where(precvec == 0)[0]
+        compress2 = np.where(fragvec == 0)[0]
+        rt, score = [], []
+        for r, ms2 in candms2.items():
+            ms1 = candms1[r]
+            candvec1 = mtv.transform(ms1)
+            candvec2 = mtv.transform(ms2)
+            candvec1[compress1] = 0
+            candvec1 /= max(candvec1)
+            candvec2[compress2] = 0
+            candvec2 /= max(candvec2)
+            sc1 = dpscore(precvec, candvec1)
+            sc2 = dpscore(fragvec, candvec2)
+            sc = (sc1 + sc2) / 2
+            if sc >= mscor:
+                rt.append(float(r))
+                score.append(sc)
+        allrt.append(rt)
+        allirt.append(irtlib[k]['irt'])
+        allscore.append(score)
 
-def fragment_eic(data, library, mztol=0.05, rtlength=30):
-    precursor = precursors[np.argmin(np.abs(precursors - exmz))]
-    rts, abunds = [], []
-    mzrange = [fragmz - mztol, fragmz + mztol]
-    rtrange = [exrt - rtlength, exrt + rtlength]    
-    for p in peaks:
-        if p.scan_time[0] > rtrange[1]:
-            break
-        if (p.scan_time[0] >= rtrange[0]) and (p.scan_time[0] <= rtrange[1]) and (p.ms_level > 1):
-            if abs(p.selected_precursors[0]['mz'] - precursor) < 1:
-                rts.append(p.scan_time[0])
-                mzs, intensities = p.centroidedPeaks[:,0], p.centroidedPeaks[:,1]
-                sel_peaks = np.arange(bisect_left(mzs, mzrange[0]), bisect_right(mzs, mzrange[1]))
-                abunds.append(np.sum(intensities[sel_peaks])) 
-    # plt.plot(rts, abunds)
-    return rts, abunds
+    irtl, rtl = [], []
+    for i in range(len(allscore)):
+        k = list(irtlib.keys())[i]
+        scores = allscore[i]
+        irt = irtlib[k]['irt']
+        if len(scores) == 0:
+            continue
+        else:
+            rt = allrt[i][np.argmax(allscore[i])]
+        irtl.append(irt)
+        rtl.append(rt)
 
+    rtl = np.array(rtl)
+    irtl = np.array(irtl).reshape(1,-1).transpose()
+    lm = LinearRegression()
+    lm.fit(irtl, rtl)
+    rtp = lm.predict(np.array(allirt).reshape(1,-1).transpose())
 
-def get_ms2(peaks, precursors, exmz, exrt):
-    precursor = precursors[np.argmin(np.abs(precursors - exmz))]
-    nearest = 10**6
-    ms2 = None
-    for p in peaks:
-        if (abs(exrt - p.scan_time[0]) < nearest) and (p.ms_level==2):
-            if p.selected_precursors[0]['mz'] == precursor:
-                ms2 = (p.centroidedPeaks[:,0], p.centroidedPeaks[:,1])
-                nearest = abs(exrt - p.scan_time[0])
-    return ms2
+    irtl, rtl = [], []
+    for i in range(len(allscore)):
+        k = list(irtlib.keys())[i]
+        scores = allscore[i] + (1 - np.abs(allrt[i] - rtp[i]) / rtp[i]) * 0.5
+        irt = irtlib[k]['irt']
+        if len(scores) == 0:
+            continue
+        else:
+            rt = allrt[i][np.argmax(scores)]
+        irtl.append(irt)
+        rtl.append(rt)
 
-
-def plot_ms(spectrum):
-    plt.figure(figsize=(6, 4), dpi=300)
-    plt.vlines(spectrum['mz'], np.zeros(spectrum.shape[0]), np.array(spectrum['intensity']), 'red') 
-    plt.axhline(0, color='black')
-    plt.xlabel('m/z')
-    plt.ylabel('Relative Intensity')
-    plt.show()
-    
-    
-def plot_anno_ms(spectrum, mzs, annotations, tol=0.1):
-    spectrum = pd.DataFrame(spectrum)
-    spectrum.columns = ['mz', 'intensity']
-    spectrum['intensity'] /= max(spectrum['intensity'])
-    c_mz, c_int, c_ann = [], [], []
-    for i, mz in enumerate(mzs):
-        diffs = abs(spectrum['mz'] - mz)
-        if min(diffs) < tol:
-            c_mz.append(spectrum['mz'][np.argmin(diffs)])
-            c_int.append(spectrum['intensity'][np.argmin(diffs)])
-            c_ann.append(annotations[i])
-    plt.figure(figsize=(6, 4), dpi=300)
-    plt.vlines(spectrum['mz'], np.zeros(spectrum.shape[0]), np.array(spectrum['intensity']), 'gray')
-    plt.vlines(c_mz, np.zeros(len(c_mz)), c_int, 'red')
-    for i in range(len(c_mz)):
-        plt.text(c_mz[i], c_int[i]+0.025, c_ann[i], color='red', rotation='vertical')
-    plt.axhline(0, color='black')
-    plt.xlabel('m/z')
-    plt.ylabel('Relative Intensity')
-    plt.show()
-    
-
-
-def plot_compare_ms(spectrum1, spectrum2, tol=0.5):
-    spectrum1 = pd.DataFrame(spectrum1)
-    spectrum2 = pd.DataFrame(spectrum2)
-    spectrum1.columns = ['mz', 'intensity']
-    spectrum2.columns = ['mz', 'intensity']
-    spectrum1['intensity'] /= np.max(spectrum1['intensity'])
-    spectrum2['intensity'] /= np.max(spectrum2['intensity'])
-    c_mz = []
-    c_int = []
-    for i in spectrum1.index:
-        diffs = abs(spectrum2['mz'] - spectrum1['mz'][i])
-        if min(diffs) < tol:
-            c_mz.append(spectrum1['mz'][i])
-            c_mz.append(spectrum2['mz'][np.argmin(diffs)])
-            c_int.append(spectrum1['intensity'][i])
-            c_int.append(-spectrum2['intensity'][np.argmin(diffs)])
-    c_spec = pd.DataFrame({'mz':c_mz, 'intensity':c_int}) 
-    plt.figure(figsize=(6, 6), dpi=300)
-    plt.vlines(spectrum1['mz'], np.zeros(spectrum1.shape[0]), np.array(spectrum1['intensity']), 'gray')
-    plt.axhline(0, color='black')
-    plt.vlines(spectrum2['mz'], np.zeros(spectrum2.shape[0]), -np.array(spectrum2['intensity']), 'gray')
-    plt.vlines(c_spec['mz'], np.zeros(c_spec.shape[0]), c_spec['intensity'], 'red')
-    plt.xlabel('m/z')
-    plt.ylabel('Relative Intensity')
-    plt.show()
-
-
-
+    rtl = np.array(rtl)
+    irtl = np.array(irtl).reshape(1,-1).transpose()
+    lm = LinearRegression()
+    lm.fit(irtl, rtl)
+    b0 = lm.intercept_
+    b1 = lm.coef_[0]
+    r2 = lm.score(irtl, rtl)
+    return b0, b1, r2
